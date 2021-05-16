@@ -115,9 +115,9 @@ private:
     static std::condition_variable condition;
     static std::condition_variable myConditionalVariable;
     static std::queue<gc_object *> Queue;
-    static std::mutex Queue_Mutex1;
-    static std::mutex Queue_Mutex2;
-
+    
+    static std::mutex shutdown_mutex;
+    static std::mutex add_job_mutex;
     static std::mutex threadpool_mutex;
     static std::mutex wait_mutex;
 
@@ -125,7 +125,6 @@ private:
     static int Num_Threads;
     static bool terminate_pool;
     static bool stopped;
-    static bool finished;
 
     static std::atomic<int> thread_finish_counter;
     static std::atomic<int> job_counter;
@@ -136,10 +135,14 @@ private:
         if (!object)
             return;
         // neco jako if NUmthreads/2 < fork
+        // we don't need any complicated synchonization here (it doesn't really matter if we spawn another job even if race condition occures)
+        if(fork_counter > 0) {
+            fork_counter -= 1;
+            Add_Job(object);
+            return;
+        }
         object->reachability_flag = true;
         object->get_ptrs(callback);
-        //Add_Job(object);
-        //auto f = std::async(std::launch::async, &gc_object::get_ptrs, object, callback);
     }
     static void Infinite_loop_function()
     {
@@ -149,7 +152,7 @@ private:
 
             //std::cout << thread_finish_counter << std::endl;
             {
-                std::unique_lock<std::mutex> lock(Queue_Mutex1);
+                std::unique_lock<std::mutex> lock(threadpool_mutex);
 
                 condition.wait(lock, [&]()
                                { return !Queue.empty() || terminate_pool; });
@@ -174,7 +177,7 @@ private:
     static void Add_Job(gc_object *New_Job)
     {
         {
-            std::unique_lock<std::mutex> lock(Queue_Mutex2);
+            std::unique_lock<std::mutex> lock(add_job_mutex);
             Queue.push(New_Job);
         }
         condition.notify_one();
@@ -182,7 +185,7 @@ private:
     static void shutdown()
     {
         {
-            std::unique_lock<std::mutex> lock(threadpool_mutex);
+            std::unique_lock<std::mutex> lock(shutdown_mutex);
             terminate_pool = true;
         } // use this flag in condition.wait
         //std::cout << "shutdown" << std::endl;
@@ -239,6 +242,7 @@ public:
 
             thread_finish_counter = 0;
             job_counter = 0;
+            fork_counter = 0;
         }
         // sweeping
         gc_object_base *sweep_iterator = head_obj.next;
@@ -400,18 +404,20 @@ public:
     }
 };
 
+
 std::condition_variable gc::condition;
 std::condition_variable gc::myConditionalVariable;
 
-std::mutex gc::Queue_Mutex1;
-std::mutex gc::Queue_Mutex2;
-std::queue<gc_object *> gc::Queue;
+std::mutex gc::shutdown_mutex;
+std::mutex gc::add_job_mutex;
 std::mutex gc::wait_mutex;
 std::mutex gc::threadpool_mutex;
+
+std::queue<gc_object *> gc::Queue;
 std::vector<std::thread> gc::Pool;
+
 bool gc::terminate_pool = false;
 bool gc::stopped = true;
-bool gc::finished = false;
 
 int gc::Num_Threads;
 std::atomic<int> gc::thread_finish_counter = 0;
