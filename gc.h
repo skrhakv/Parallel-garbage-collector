@@ -22,15 +22,13 @@ class gc_object_base
     gc_object_base *next = nullptr;
 
 public:
-    virtual ~gc_object_base()
-    {
-        if (DEBUG)
-            std::cout << "virtual!" << std::endl;
-    }
+    virtual ~gc_object_base() {}
 };
 
+// head & tail for gc_object
 gc_object_base head_obj;
 gc_object_base *actual_obj = &head_obj;
+
 class gc_object : gc_object_base
 {
     friend class gc;
@@ -51,44 +49,33 @@ public:
         prev = actual_obj;
         actual_obj->next = this;
         actual_obj = this;
-        // we want to rewrite list pointers, because here we are creating a new instance
     }
-    gc_object(gc_object &&) = delete;
+    gc_object(gc_object &&) = delete; // move constructor is actually never called (copy constructor is called instead)
     gc_object &operator=(const gc_object &)
     {
         if (DEBUG)
             std::cout << "copy assignment" << std::endl;
 
         return *this;
-        // we don't want to rewrite list pointers (next, prev), because that would lead to memory leak
-        // we are not creating new instance, just rewriting the old one
     }
-    gc_object &operator=(const gc_object &&) = delete;
+    gc_object &operator=(const gc_object &&) = delete; // move assignment is actually never called (copy constructor is called instead)
     ~gc_object()
     {
         if (DEBUG)
-            std::cout << "let's call it done chaps!" << std::endl;
+            std::cout << "let's call it done chaps! (~gc_object)" << std::endl;
         if (actual_obj == this)
-        {
             actual_obj = prev;
-            //      std::cout << actual_obj << '\t'<< prev << std::endl;
-        }
+
+        // if prev/next are not null then keep the list valid
         if (prev)
-        {
             prev->next = next;
-        }
+
         if (next)
-        {
             next->prev = prev;
-        }
     }
 
 protected:
-    virtual void get_ptrs(std::function<void(gc_object *)>)
-    {
-        if (DEBUG)
-            std::cout << "get pointers in base class" << std::endl;
-    }
+    virtual void get_ptrs(std::function<void(gc_object *)>) {}
 };
 
 template <typename T>
@@ -105,6 +92,8 @@ class gc_root_ptr_base
     gc_root_ptr_base *next = nullptr;
 };
 
+
+// head & tail of gc_root_ptr list
 gc_root_ptr_base head_root;
 gc_root_ptr_base *actual_root;
 class gc
@@ -112,17 +101,19 @@ class gc
 private:
     template <typename T>
     friend class gc_root_ptr;
-    static std::condition_variable condition;
-    static std::condition_variable myConditionalVariable;
-    static std::queue<gc_object *> Queue;
-    
+
+    static std::condition_variable threadpool_condition;
+    static std::condition_variable end_of_marking_condition;
+
     static std::mutex shutdown_mutex;
     static std::mutex add_job_mutex;
     static std::mutex threadpool_mutex;
     static std::mutex wait_mutex;
 
-    static std::vector<std::thread> Pool;
-    static int Num_Threads;
+    static std::vector<std::thread> pool;
+    static std::queue<gc_object *> queue;
+
+    static int hw_threads;
     static bool terminate_pool;
     static bool stopped;
 
@@ -134,81 +125,84 @@ private:
     {
         if (!object)
             return;
-        // neco jako if NUmthreads/2 < fork
         // we don't need any complicated synchonization here (it doesn't really matter if we spawn another job even if race condition occures)
-        if(fork_counter > 0) {
+        // std::cout << fork_counter << std::endl;
+
+        object->reachability_flag = true;
+        if (fork_counter > 0)
+        {
             fork_counter -= 1;
-            Add_Job(object);
+            job_counter += 1;
+            add_job(object);
             return;
         }
-        object->reachability_flag = true;
         object->get_ptrs(callback);
     }
-    static void Infinite_loop_function()
+    static void threadpool_loop()
     {
         while (true)
         {
-            gc_object *Job = nullptr;
+            gc_object *job = nullptr;
 
-            //std::cout << thread_finish_counter << std::endl;
             {
                 std::unique_lock<std::mutex> lock(threadpool_mutex);
 
-                condition.wait(lock, [&]()
-                               { return !Queue.empty() || terminate_pool; });
-                if (!Queue.empty())
+                threadpool_condition.wait(lock, [&]()
+                                          { return !queue.empty() || terminate_pool; });
+                if (!queue.empty())
                 {
-                    Job = Queue.front();
-                    Queue.pop();
+                    job = queue.front();
+                    queue.pop();
                 }
             }
-            if (Job != nullptr)
+            if (job != nullptr)
             {
-                Job->get_ptrs(callback); // function<void()> type
+                job->get_ptrs(callback); 
                 fork_counter += 1;
+                //std::cout << "increase fork_counter: "<< fork_counter << std::endl;
                 thread_finish_counter += 1;
+                //std:: cout << thread_finish_counter << '\t' << job_counter << std::endl;
+
                 if (thread_finish_counter == job_counter)
-                    myConditionalVariable.notify_all();
+                    end_of_marking_condition.notify_all();
             }
             else
                 break;
         }
     };
-    static void Add_Job(gc_object *New_Job)
+    static void add_job(gc_object *New_Job)
     {
         {
             std::unique_lock<std::mutex> lock(add_job_mutex);
-            Queue.push(New_Job);
+            queue.push(New_Job);
         }
-        condition.notify_one();
+        threadpool_condition.notify_one();
     }
-    static void shutdown()
+    static void terminate_threads()
     {
         {
             std::unique_lock<std::mutex> lock(shutdown_mutex);
             terminate_pool = true;
-        } // use this flag in condition.wait
-        //std::cout << "shutdown" << std::endl;
-        condition.notify_all(); // wake up all threads.
+        }
 
-        // Join all threads.
-        for (std::thread &every_thread : Pool)
+        threadpool_condition.notify_all();
+        for (std::thread &every_thread : pool)
         {
             every_thread.join();
         }
 
-        Pool.clear();
-        stopped = true; // use this flag in destructor, if not set, call shutdown()
+        pool.clear();
+        stopped = true; 
     }
 
 public:
     gc() {}
     static void start_threadpool()
     {
-        Num_Threads = std::thread::hardware_concurrency();
-        for (int ii = 0; ii < Num_Threads; ii++)
+        hw_threads = std::thread::hardware_concurrency();
+        for (int i = 0; i < hw_threads; i++)
         {
-            Pool.push_back(std::thread(Infinite_loop_function));
+            pool.push_back(std::thread(threadpool_loop));
         }
         terminate_pool = false;
         stopped = false;
@@ -220,37 +214,38 @@ public:
             start_threadpool();
         }
         auto mark_iterator = head_root.next;
-
+        fork_counter = hw_threads;
+        thread_finish_counter = 0;
+        job_counter = 0;
         while (mark_iterator)
         {
             if (mark_iterator->gc_object_pointer)
             {
                 mark_iterator->gc_object_pointer->reachability_flag = true;
-                Add_Job(mark_iterator->gc_object_pointer);
-                job_counter++;
-                //auto f = std::async(std::launch::async, &gc_object::get_ptrs, mark_iterator->gc_object_pointer, f_callback);
+
+                // check if we are at the end gc_root_ptr list
+                //if(mark_iterator->next)
+                {
+                    add_job(mark_iterator->gc_object_pointer);
+                    job_counter++;
+                }
+               
             }
             mark_iterator = mark_iterator->next;
         }
+        
         {
-            //lock the mutex first!
             std::unique_lock<std::mutex> myLock(wait_mutex);
 
-            //wait till a condition is met
-            myConditionalVariable.wait(myLock, [&]()
-                                       { return thread_finish_counter == job_counter; });
-
-            thread_finish_counter = 0;
-            job_counter = 0;
-            fork_counter = 0;
+            end_of_marking_condition.wait(myLock, [&]()
+                                          { return thread_finish_counter == job_counter; });
         }
         // sweeping
         gc_object_base *sweep_iterator = head_obj.next;
-        //        std::cout << "sweep address: " <<&head_obj<<std::endl;
+        //std::cout << "here1" << std::endl;
 
         while (sweep_iterator)
         {
-            //std::cout << "sweep address: " <<sweep_iterator<<std::endl;
             if (DEBUG)
                 std::cout << "Sweep it boys" << std::endl;
             if (!(sweep_iterator->reachability_flag))
@@ -271,7 +266,7 @@ public:
             }
         }
         if (actual_obj == &head_obj)
-            shutdown();
+            terminate_threads();
     }
 };
 template <typename T>
@@ -304,7 +299,6 @@ public:
         prev = actual_root;
         actual_root->next = this;
         actual_root = this;
-        // we want to rewrite list pointers, because here we are creating a new instance
     }
     gc_root_ptr(gc_root_ptr &&other)
     {
@@ -312,7 +306,6 @@ public:
         {
             actual_root = &head_root;
         }
-        //std::cout << "other pt" << other.pt << std::endl;
 
         pt = other.pt;
         gc_object_pointer = other.gc_object_pointer;
@@ -329,13 +322,10 @@ public:
         pt = other.pt;
         gc_object_pointer = other.gc_object_pointer;
         return *this;
-        // we don't want to rewrite list pointers (next, prev), because that would lead to memory leak
-        // we are not creating new instance, just rewriting the old one
     }
     gc_root_ptr &operator=(gc_root_ptr &&other)
     {
         pt = other.pt;
-        //std::cout << "other pt" << pt << std::endl;
         gc_object_pointer = other.gc_object_pointer;
         other.pt = nullptr;
         other.gc_object_pointer = nullptr;
@@ -374,7 +364,7 @@ public:
             next->prev = prev;
         }
         if (&head_root == actual_root)
-            gc::shutdown();
+            gc::terminate_threads();
     }
     T *operator->() const
     {
@@ -392,7 +382,7 @@ public:
     void reset(T *ptr = nullptr)
     {
         if (!ptr && DEBUG)
-            std::cout << "NULL!!!" << std::endl;
+            std::cout << "ptr is NULL!" << std::endl;
         this->pt = ptr;
         this->gc_object_pointer = (gc_object *)ptr;
     }
@@ -404,22 +394,21 @@ public:
     }
 };
 
-
-std::condition_variable gc::condition;
-std::condition_variable gc::myConditionalVariable;
+std::condition_variable gc::threadpool_condition;
+std::condition_variable gc::end_of_marking_condition;
 
 std::mutex gc::shutdown_mutex;
 std::mutex gc::add_job_mutex;
 std::mutex gc::wait_mutex;
 std::mutex gc::threadpool_mutex;
 
-std::queue<gc_object *> gc::Queue;
-std::vector<std::thread> gc::Pool;
+std::queue<gc_object *> gc::queue;
+std::vector<std::thread> gc::pool;
 
 bool gc::terminate_pool = false;
 bool gc::stopped = true;
+int gc::hw_threads;
 
-int gc::Num_Threads;
 std::atomic<int> gc::thread_finish_counter = 0;
 std::atomic<int> gc::job_counter = 0;
 std::atomic<int> gc::fork_counter = 0;
